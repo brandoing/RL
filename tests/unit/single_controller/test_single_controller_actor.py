@@ -456,7 +456,9 @@ def test_sync_weights_honors_recompute_kv_cache_config(
     ctrl._gen_fleet = None
     ctrl._weight_synchronizer = SimpleNamespace(sync_weights=MagicMock())
     ctrl._rollout_manager = SimpleNamespace(resume_request_deadlines=MagicMock())
+    ctrl._trainer_version = 3
     ctrl._gen = SimpleNamespace(
+        set_generation_weight_version=MagicMock(),
         invalidate_kv_cache=MagicMock(),
         requires_kv_scale_sync=False,
     )
@@ -474,6 +476,8 @@ def test_sync_weights_honors_recompute_kv_cache_config(
     assert ctrl._gen.invalidate_kv_cache.call_count == expected_invalidation_calls
     assert ctrl._rollout_permitted.is_set()
 
+    ctrl._gen.set_generation_weight_version.assert_called_once_with(3)
+
 
 def test_sync_weights_calibrates_and_forwards_fp8_kv_scales() -> None:
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
@@ -487,7 +491,9 @@ def test_sync_weights_calibrates_and_forwards_fp8_kv_scales() -> None:
     ctrl._gen_fleet = None
     ctrl._weight_synchronizer = SimpleNamespace(sync_weights=MagicMock())
     ctrl._rollout_manager = SimpleNamespace(resume_request_deadlines=MagicMock())
+    ctrl._trainer_version = 3
     ctrl._gen = SimpleNamespace(
+        set_generation_weight_version=MagicMock(),
         invalidate_kv_cache=MagicMock(),
         requires_kv_scale_sync=True,
     )
@@ -517,6 +523,8 @@ def test_sync_weights_calibrates_and_forwards_fp8_kv_scales() -> None:
     ctrl._weight_synchronizer.sync_weights.assert_called_once_with(
         kv_scales={"layer.0": 0.5}
     )
+
+    ctrl._gen.set_generation_weight_version.assert_called_once_with(3)
 
 
 class _AdvantageDataPlane:
@@ -781,6 +789,7 @@ def test_advantage_stage_composes_all_filters_before_computing_advantages(
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
         grpo=GRPOConfig(
+            num_generations_per_prompt=batch_size,
             seq_logprob_error_threshold=2.0,
             overlong_filtering=True,
             invalid_tool_call_advantage=-5.0,
@@ -802,6 +811,7 @@ def test_advantage_stage_composes_all_filters_before_computing_advantages(
         task_name="train",
         sample_ids=[f"sample-{i}" for i in range(batch_size)],
         fields=list(data.keys()),
+        tags=[{"group_id": "prompt-0", "rollout_index": i} for i in range(batch_size)],
     )
 
     result_meta, has_valid_training_tokens = asyncio.run(ctrl._advantage_stage(meta))
@@ -882,6 +892,7 @@ def test_advantage_stage_writes_each_sample_filter_without_seq_threshold(
     ctrl._is_ppo = False
     ctrl._message_level_advantage_penalties_enabled = False
     ctrl._algo_cfg = GRPOConfig(
+        num_generations_per_prompt=batch_size,
         seq_logprob_error_threshold=None,
         overlong_filtering=overlong_filtering,
     )
@@ -898,6 +909,7 @@ def test_advantage_stage_writes_each_sample_filter_without_seq_threshold(
         task_name="train",
         sample_ids=[f"sample-{i}" for i in range(batch_size)],
         fields=list(data.keys()),
+        tags=[{"group_id": "prompt-0", "rollout_index": i} for i in range(batch_size)],
     )
 
     _, has_valid_training_tokens = asyncio.run(ctrl._advantage_stage(meta))
@@ -947,7 +959,9 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
     ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
-        grpo=GRPOConfig(seq_logprob_error_threshold=None)
+        grpo=GRPOConfig(
+            num_generations_per_prompt=batch_size, seq_logprob_error_threshold=None
+        )
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = False
@@ -964,6 +978,7 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
         task_name="train",
         sample_ids=[f"sample-{i}" for i in range(batch_size)],
         fields=list(data.keys()),
+        tags=[{"group_id": "prompt-0", "rollout_index": i} for i in range(batch_size)],
     )
 
     _, has_valid_training_tokens = asyncio.run(ctrl._advantage_stage(meta))
@@ -1015,6 +1030,7 @@ def test_advantage_stage_clips_training_values_and_metrics() -> None:
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
         grpo=GRPOConfig(
+            num_generations_per_prompt=batch_size,
             seq_logprob_error_threshold=None,
             advantage_clip_low=-1.0,
             advantage_clip_high=2.0,
@@ -1035,6 +1051,7 @@ def test_advantage_stage_clips_training_values_and_metrics() -> None:
         task_name="train",
         sample_ids=[f"sample-{i}" for i in range(batch_size)],
         fields=list(data.keys()),
+        tags=[{"group_id": "prompt-0", "rollout_index": i} for i in range(batch_size)],
     )
 
     asyncio.run(ctrl._advantage_stage(meta))
@@ -1083,7 +1100,9 @@ def test_advantage_stage_skips_estimator_when_seq_mask_removes_whole_chunk(
     ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
-        grpo=GRPOConfig(seq_logprob_error_threshold=2.0)
+        grpo=GRPOConfig(
+            num_generations_per_prompt=batch_size, seq_logprob_error_threshold=2.0
+        )
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = False
@@ -1100,6 +1119,7 @@ def test_advantage_stage_skips_estimator_when_seq_mask_removes_whole_chunk(
         task_name="train",
         sample_ids=[f"sample-{i}" for i in range(batch_size)],
         fields=list(data.keys()),
+        tags=[{"group_id": "prompt-0", "rollout_index": i} for i in range(batch_size)],
     )
 
     result_meta, has_valid_training_tokens = asyncio.run(ctrl._advantage_stage(meta))
@@ -1146,7 +1166,9 @@ def test_advantage_stage_skips_preexisting_empty_mask_without_seq_threshold() ->
     ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = False
     ctrl._master_config = SimpleNamespace(
-        grpo=GRPOConfig(seq_logprob_error_threshold=None)
+        grpo=GRPOConfig(
+            num_generations_per_prompt=batch_size, seq_logprob_error_threshold=None
+        )
     )
     ctrl._algo_cfg = ctrl._master_config.grpo
     ctrl._message_level_advantage_penalties_enabled = False
@@ -1163,6 +1185,7 @@ def test_advantage_stage_skips_preexisting_empty_mask_without_seq_threshold() ->
         task_name="train",
         sample_ids=[f"sample-{i}" for i in range(batch_size)],
         fields=list(data.keys()),
+        tags=[{"group_id": "prompt-0", "rollout_index": i} for i in range(batch_size)],
     )
 
     result_meta, has_valid_training_tokens = asyncio.run(ctrl._advantage_stage(meta))
@@ -1230,6 +1253,7 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
     ctrl._dp_client = FakeDataPlane()
     ctrl._master_config = SimpleNamespace(
         grpo=GRPOConfig(
+            num_generations_per_prompt=2,
             seq_logprob_error_threshold=None,
             advantage_clip_high=0.1,
         )
@@ -1253,6 +1277,7 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
         sample_ids=["a", "b"],
         fields=[],
         sequence_lengths=[3, 3],
+        tags=[{"group_id": "prompt-0", "rollout_index": i} for i in range(2)],
     )
 
     enriched, has_valid_training_tokens = asyncio.run(ctrl._advantage_stage(meta))
@@ -2547,7 +2572,11 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
     ctrl._teacher_logprobs_required = False
     ctrl._is_ppo = True
     ctrl._master_config = SimpleNamespace(
-        ppo=SimpleNamespace(seq_logprob_error_threshold=None, overlong_filtering=False)
+        ppo=SimpleNamespace(
+            num_generations_per_prompt=batch_size,
+            seq_logprob_error_threshold=None,
+            overlong_filtering=False,
+        )
     )
     ctrl._algo_cfg = ctrl._master_config.ppo
     ctrl._message_level_advantage_penalties_enabled = False
@@ -2564,6 +2593,7 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
         task_name="train",
         sample_ids=[f"sample-{i}" for i in range(batch_size)],
         fields=list(data.keys()),
+        tags=[{"group_id": "prompt-0", "rollout_index": i} for i in range(batch_size)],
     )
 
     result_meta, has_valid_training_tokens = asyncio.run(ctrl._advantage_stage(meta))
