@@ -93,6 +93,7 @@ from nemo_rl.algorithms.grpo import (
     GRPOConfig,
     GRPOSaveState,
     _clip_grpo_advantages,
+    _resolve_token_logprob_diagnostics_config,
     _write_latest_checkpoint_status,
     aggregate_rollout_metrics,
     compute_and_apply_seq_logprob_error_masking,
@@ -131,6 +132,12 @@ from nemo_rl.algorithms.single_controller_utils.utils import (
 )
 from nemo_rl.data.interfaces import DatumSpec
 from nemo_rl.data.multimodal_utils import present_multimodal_fields
+from nemo_rl.data.packed_rollouts import (
+    PACKED_ATTENTION_SEGMENT_LENGTHS,
+    TREE_ATTENTION_EDGE_LENGTHS,
+    TREE_ATTENTION_EDGE_TARGET_IDS,
+    TREE_ATTENTION_LAYOUTS,
+)
 from nemo_rl.data_plane import DATA_PLANE_CHECKPOINT_SCHEMA_VERSION, KVBatchMeta
 from nemo_rl.data_plane.async_utils import call_data_plane
 from nemo_rl.data_plane.schema import (
@@ -318,6 +325,18 @@ class SingleControllerActor:
             master_config.loss_fn.force_on_policy_ratio
             and self._algo_cfg.seq_logprob_error_threshold is None
         )
+        self._token_logprob_diagnostics_config = (
+            _resolve_token_logprob_diagnostics_config(master_config.logger)
+        )
+        self._diagnostic_tokenizer = actor_args.tokenizer
+        if self._token_logprob_diagnostics_config.enabled and (
+            self._diagnostic_tokenizer is None or not self._policy_logprobs_required
+        ):
+            raise ValueError(
+                "Token logprob diagnostics require a tokenizer and recomputed policy logprobs"
+            )
+        self._token_logprob_diagnostic_records: list[dict[str, Any]] = []
+        self._token_logprob_diagnostic_sample_offset = 0
         # _build_trainer initializes the reference model only for a positive KL
         # penalty, so the controller must use the same gate before requesting it.
         self._reference_logprobs_required = bool(
@@ -2863,6 +2882,7 @@ class SingleControllerActor:
                     )
                 except RayActorError as error:
                     log.warning("Skipping generation step metrics: %s", error)
+                self._flush_token_logprob_diagnostics()
                 self._step_log_dict = {k: [] for k in self._step_log_dict}
                 step_metrics.update(
                     _pooled_opd_metrics(
@@ -4709,12 +4729,18 @@ class SingleControllerActor:
             return meta, True
         adv_cfg = self._advantage_cfg
 
+        diagnostic_config = self._token_logprob_diagnostics_config
+        input_fields = self._advantage_input_fields()
+        if diagnostic_config.enabled and TREE_ATTENTION_LAYOUTS in meta.extra_info:
+            input_fields.extend(
+                [TREE_ATTENTION_EDGE_TARGET_IDS, TREE_ATTENTION_EDGE_LENGTHS]
+            )
         data = await call_data_plane(
             self._dp_client,
             "get_samples",
             sample_ids=meta.sample_ids,
             partition_id=meta.partition_id,
-            select_fields=self._advantage_input_fields(),
+            select_fields=input_fields,
         )
 
         advantage_group_ids = advantage_group_ids_from_meta(
@@ -4746,6 +4772,9 @@ class SingleControllerActor:
         # report sequence-level generation/training mismatch. A threshold adds
         # masking; leaving it unset keeps this metrics-only.
         if self._policy_logprobs_required:
+            original_sample_mask = (
+                final_sample_mask.clone() if diagnostic_config.enabled else None
+            )
             masking_data = BatchedDataDict(
                 {
                     "token_mask": token_mask,
@@ -4769,8 +4798,35 @@ class SingleControllerActor:
                 train_data=masking_data,
                 rewards=rewards,
                 seq_logprob_error_threshold=seq_logprob_error_threshold,
+                include_per_sequence_errors=diagnostic_config.enabled,
             )
             final_sample_mask = masking_data["sample_mask"]
+            if diagnostic_config.enabled:
+                assert original_sample_mask is not None
+                self._collect_token_logprob_diagnostics(
+                    meta=meta,
+                    diagnostic_data={
+                        **masking_data,
+                        "input_ids": tensor_field(data, "input_ids"),
+                        "input_lengths": tensor_field(data, "input_lengths"),
+                        "sample_mask": original_sample_mask,
+                    },
+                    edge_targets=(
+                        tensor_field(data, TREE_ATTENTION_EDGE_TARGET_IDS)
+                        if TREE_ATTENTION_LAYOUTS in meta.extra_info
+                        else None
+                    ),
+                    edge_lengths=(
+                        tensor_field(data, TREE_ATTENTION_EDGE_LENGTHS)
+                        if TREE_ATTENTION_LAYOUTS in meta.extra_info
+                        else None
+                    ),
+                    sequence_errors=seq_error_metrics.pop(
+                        "_per_sequence_mult_prob_error"
+                    ),
+                    final_sample_mask=final_sample_mask,
+                    rewards=rewards,
+                )
             num_valid_seqs_after = float(
                 ((token_mask[:, 1:] * final_sample_mask.unsqueeze(-1)).sum(dim=-1) > 0)
                 .sum()
@@ -4906,6 +4962,92 @@ class SingleControllerActor:
 
     # ── utility helpers ────────────────────────────────────────────────────
 
+    def _collect_token_logprob_diagnostics(
+        self,
+        *,
+        meta: KVBatchMeta,
+        diagnostic_data: dict[str, Any],
+        edge_targets: Optional[torch.Tensor],
+        edge_lengths: Optional[torch.Tensor],
+        sequence_errors: torch.Tensor,
+        final_sample_mask: torch.Tensor,
+        rewards: torch.Tensor,
+    ) -> None:
+        """Keep the largest configured outliers across all chunks of one step."""
+        config = self._token_logprob_diagnostics_config
+        if edge_targets is not None:
+            assert edge_lengths is not None
+            diagnostic_data["input_ids"] = torch.cat(
+                [edge_targets.new_zeros((edge_targets.shape[0], 1)), edge_targets],
+                dim=1,
+            )
+            diagnostic_data["input_lengths"] = edge_lengths + 1
+        if PACKED_ATTENTION_SEGMENT_LENGTHS in meta.extra_info:
+            diagnostic_data["attention_segment_lengths"] = meta.extra_info[
+                PACKED_ATTENTION_SEGMENT_LENGTHS
+            ]
+        tags = meta.tags if meta.tags is not None else [{} for _ in meta.sample_ids]
+        metadata = [
+            {
+                **{
+                    key: tag[key]
+                    for key in (
+                        "group_id",
+                        "prompt_idx",
+                        "rollout_index",
+                        "weight_version",
+                    )
+                    if key in tag
+                },
+                "sample_id": sample_id,
+                "trainer_weight_version": self._trainer_version,
+                "reward": float(rewards[index]),
+                "sample_mask_after_filter": float(final_sample_mask[index]),
+            }
+            for index, (sample_id, tag) in enumerate(
+                zip(meta.sample_ids, tags, strict=True)
+            )
+        ]
+        records = self._logger.build_token_logprob_diagnostics(
+            diagnostic_data,
+            self._diagnostic_tokenizer,
+            self._train_steps + 1,
+            per_sequence_mult_prob_error=sequence_errors,
+            sample_metadata=metadata,
+            max_sequences=config.max_sequences,
+            top_k_tokens_per_sequence=config.top_k_tokens_per_sequence,
+            min_abs_logprob_diff=config.min_abs_logprob_diff,
+            min_sequence_mult_prob_error=config.min_sequence_mult_prob_error,
+            context_tokens=config.context_tokens,
+            relative_position_bins=config.relative_position_bins,
+            top_token_ids_by_total_abs_diff=config.top_token_ids_by_total_abs_diff,
+        )
+        for record in records:
+            record["sample_index"] += self._token_logprob_diagnostic_sample_offset
+        self._token_logprob_diagnostic_sample_offset += meta.size
+        self._token_logprob_diagnostic_records.extend(records)
+        self._token_logprob_diagnostic_records.sort(
+            key=lambda record: (
+                record["sequence_mult_prob_error"]
+                if record["sequence_mult_prob_error"] is not None
+                else float("inf")
+            ),
+            reverse=True,
+        )
+        del self._token_logprob_diagnostic_records[config.max_sequences :]
+
+    def _flush_token_logprob_diagnostics(self) -> None:
+        """Write at most max_sequences records for a completed optimizer step."""
+        if not self._token_logprob_diagnostics_config.enabled:
+            return
+        for rank, record in enumerate(self._token_logprob_diagnostic_records):
+            record["diagnostic_rank"] = rank
+        self._logger.log_token_logprob_diagnostic_records(
+            self._token_logprob_diagnostic_records, self._train_steps + 1
+        )
+        self._token_logprob_diagnostic_records = []
+        self._token_logprob_diagnostic_sample_offset = 0
+
     def _advantage_input_fields(self) -> list[str]:
         adv_cfg = self._advantage_cfg
         fields = [
@@ -4933,6 +5075,8 @@ class SingleControllerActor:
             fields.append(adv_cfg.teacher_logprobs_field)
         if self._is_ppo:
             fields.append(adv_cfg.values_field)
+        if self._token_logprob_diagnostics_config.enabled:
+            fields.extend(["input_ids", "input_lengths"])
         return list(dict.fromkeys(fields))
 
     def _retune_lookahead_versions(self) -> None:

@@ -637,6 +637,41 @@ $$
 
 Intuitively, this measures the average multiplicative probability error for sampled tokens, where samples are drawn as $x \sim \pi_{\text{inference-framework}}$. The purpose of this is to highlight any obvious sampling errors or discrepancies between the inference backend and training framework. If it trends upward steeply over the course of training past $\sim 1-2\%$, there is usually a problem with how your weights are being updated. If these metrics are very spiky, they can indicate a bug in the inference framework or buggy weight refitting.
 
+### Token-level logprob diagnostics
+
+Enable `logger.token_logprob_diagnostics.enabled` to inspect the sampled tokens
+behind generation/recompute probability errors. This works in both the legacy
+GRPO loop and the single controller. For example:
+
+```yaml
+logger:
+  token_logprob_diagnostics:
+    enabled: true
+    max_sequences: 32
+    top_k_tokens_per_sequence: 32
+    min_sequence_mult_prob_error: 1.05
+    min_abs_logprob_diff: 0.25
+    context_tokens: 8
+```
+
+The single controller retains the largest sequence errors across all chunks in
+an optimizer step and writes at most `max_sequences` records to
+`<log_dir>/logprob_diagnostics/token_logprob_outliers_step_<step>.jsonl`. Step
+numbers follow completed optimizer updates, including after checkpoint resume.
+Records include token IDs and decoded context, generation and recomputed
+logprobs, attention-segment boundaries when available, and the sample ID,
+reward, generation weight version when recorded, trainer weight version, and
+sample mask after filtering. Sequences removed by the logprob-error filter
+remain eligible for diagnostics; preexisting sample exclusions remain excluded.
+Tree-attention records identify sampled edge targets rather than physical tree
+node positions.
+
+These diagnostics leave rewards, filtering, and advantages unchanged. They
+require a tokenizer and recomputed policy logprobs; the single controller rejects
+an enabled configuration that cannot supply them. When disabled, it does not
+fetch the additional token fields or write diagnostic files. Only bounded
+diagnostic records are retained between chunks, not their input tensors.
+
 ### KL Divergence Error
 This feature is controlled by the following metrics:
 * `gen_kl_error`: $D_{\text{KL}}(P_{gen} || P_{policy})$

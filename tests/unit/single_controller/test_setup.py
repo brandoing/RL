@@ -1299,6 +1299,7 @@ class TestSetup:
 
         assert isinstance(actor_args, SingleControllerActorArgs)
         assert actor_args.gen_handle is patched_factories["fake_gen"]
+        assert actor_args.tokenizer is tokenizer
         assert actor_args.trainer_handle is patched_factories["fake_policy"]
         assert actor_args.env_handles is patched_factories["env_handles"]
         assert (

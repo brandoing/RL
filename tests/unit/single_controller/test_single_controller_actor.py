@@ -15,8 +15,11 @@
 """Tests for SingleController initialization and pump lifecycle."""
 
 import asyncio
+import json
 import math
+from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -27,7 +30,11 @@ from tensordict import TensorDict
 import nemo_rl.algorithms.single_controller as single_controller
 from nemo_rl.algorithms.async_utils.replay_buffer import DataPlaneCheckpointBarrier
 from nemo_rl.algorithms.async_utils.staleness_sampler import BaseSampler
-from nemo_rl.algorithms.grpo import GRPOConfig, _initial_grpo_save_state
+from nemo_rl.algorithms.grpo import (
+    GRPOConfig,
+    TokenLogprobDiagnosticsConfig,
+    _initial_grpo_save_state,
+)
 from nemo_rl.algorithms.loss import ClippedPGLossConfig
 from nemo_rl.algorithms.metric_utils import SetupTimingMetrics
 from nemo_rl.algorithms.ppo import PPOConfig
@@ -40,10 +47,18 @@ from nemo_rl.algorithms.single_controller_utils.config import (
     AsyncRLConfig,
     MasterConfig,
 )
+from nemo_rl.data.packed_rollouts import (
+    PACKED_ATTENTION_SEGMENT_LENGTHS,
+    TREE_ATTENTION_EDGE_LENGTHS,
+    TREE_ATTENTION_EDGE_TARGET_IDS,
+    TREE_ATTENTION_LAYOUTS,
+    TreeAttentionLayout,
+)
 from nemo_rl.data_plane import KVBatchMeta
 from nemo_rl.data_plane.schema import ROLLOUT_METRICS
 from nemo_rl.distributed.batched_data_dict import BatchedDataDict
 from nemo_rl.experience.rollout_recovery import RolloutRecoveryLedger
+from nemo_rl.utils.logger import Logger
 from nemo_rl.utils.timer import TimeoutChecker, Timer
 
 
@@ -135,6 +150,7 @@ def _actor_args_for_init(**overrides) -> SimpleNamespace:
         save_state=_initial_grpo_save_state(),
         last_checkpoint_path=None,
         finalizer_actors=[],
+        tokenizer=None,
         data_plane_checkpoint_metadata=None,
         bootstrap_identity=None,
         rollout_checkpoint_load_metrics=None,
@@ -330,6 +346,7 @@ def _lookahead_controller(
     """Bare actor carrying only what the lookahead schedule reads."""
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
+    ctrl._token_logprob_diagnostics_config = TokenLogprobDiagnosticsConfig()
     ctrl._is_ppo = is_ppo
     ctrl._trainer_version = trainer_version
     ctrl._algo_cfg = SimpleNamespace(
@@ -428,6 +445,7 @@ def test_sync_weights_honors_recompute_kv_cache_config(
 ) -> None:
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
+    ctrl._token_logprob_diagnostics_config = TokenLogprobDiagnosticsConfig()
     ctrl._async_cfg = AsyncRLConfig(
         recompute_kv_cache_after_weight_updates=recompute_kv_cache
     )
@@ -460,6 +478,7 @@ def test_sync_weights_honors_recompute_kv_cache_config(
 def test_sync_weights_calibrates_and_forwards_fp8_kv_scales() -> None:
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
+    ctrl._token_logprob_diagnostics_config = TokenLogprobDiagnosticsConfig()
     ctrl._async_cfg = AsyncRLConfig()
     ctrl._rollout_permitted = asyncio.Event()
     ctrl._rollout_permitted.set()
@@ -526,6 +545,197 @@ class _MaskRecordingAdvantageEstimator:
         return rewards.unsqueeze(-1).expand_as(mask).clone()
 
 
+class _DiagnosticTokenizer:
+    def decode(self, token_ids: list[int], **kwargs: Any) -> str:
+        return ",".join(str(value) for value in token_ids)
+
+    def encode(self, text: str, **kwargs: Any) -> list[int]:
+        return [int(value) for value in text.split(",")]
+
+
+def _diagnostic_controller(tmp_path: Path, *, enabled: bool = True) -> Any:
+    controller_cls = SingleControllerActor.__ray_metadata__.modified_class
+    ctrl = object.__new__(controller_cls)
+    ctrl._token_logprob_diagnostics_config = TokenLogprobDiagnosticsConfig(
+        enabled=enabled, max_sequences=2, top_k_tokens_per_sequence=2, context_tokens=1
+    )
+    ctrl._diagnostic_tokenizer = _DiagnosticTokenizer()
+    ctrl._token_logprob_diagnostic_records = []
+    ctrl._token_logprob_diagnostic_sample_offset = 0
+    ctrl._train_steps = 9
+    ctrl._trainer_version = 9
+    ctrl._logger = Logger(
+        {
+            "log_dir": str(tmp_path),
+            "wandb_enabled": False,
+            "tensorboard_enabled": False,
+            "mlflow_enabled": False,
+            "swanlab_enabled": False,
+            "monitor_gpus": False,
+            "wandb": {},
+        }
+    )
+    ctrl._advantage_cfg = AdvantageConfig()
+    ctrl._advantage_estimator = _MaskRecordingAdvantageEstimator()
+    ctrl._data_plane_checkpoint_barrier = DataPlaneCheckpointBarrier()
+    ctrl._policy_logprobs_required = True
+    ctrl._reference_logprobs_required = False
+    ctrl._teacher_logprobs_required = False
+    ctrl._is_ppo = False
+    ctrl._algo_cfg = GRPOConfig(
+        seq_logprob_error_threshold=2.0, num_generations_per_prompt=2
+    )
+    ctrl._message_level_advantage_penalties_enabled = False
+    ctrl._step_log_dict = {
+        name: []
+        for name in (
+            "rewards",
+            "sample_masks",
+            "masked_advantages",
+            "sequence_lengths",
+            "num_mask_sample_filtered",
+            "seq_logprob_error_metrics",
+        )
+    }
+    return ctrl
+
+
+def _diagnostic_chunk(
+    errors: tuple[float, float], group: str
+) -> tuple[TensorDict, KVBatchMeta]:
+    data = TensorDict(
+        {
+            "input_ids": torch.tensor([[10, 11, 12], [20, 21, 22]]),
+            "input_lengths": torch.tensor([3, 3]),
+            "prompt_ids_for_adv": torch.zeros(2, 3, dtype=torch.long),
+            "total_reward": torch.tensor([0.0, 1.0]),
+            "token_mask": torch.tensor([[0.0, 1.0, 1.0], [0.0, 1.0, 1.0]]),
+            "sample_mask": torch.ones(2),
+            "mask_sample": torch.zeros(2, dtype=torch.bool),
+            "truncated": torch.zeros(2, dtype=torch.bool),
+            "prev_logprobs": torch.zeros(2, 3),
+            "generation_logprobs": torch.tensor(
+                [
+                    [0.0, math.log(errors[0]), math.log(errors[0])],
+                    [0.0, math.log(errors[1]), math.log(errors[1])],
+                ]
+            ),
+        },
+        batch_size=[2],
+    )
+    meta = KVBatchMeta(
+        partition_id="rollout_data",
+        task_name="train",
+        sample_ids=[group + "-0", group + "-1"],
+        fields=list(data.keys()),
+        tags=[
+            {
+                "group_id": group,
+                "rollout_index": i,
+                "prompt_idx": 17,
+                "weight_version": 8,
+            }
+            for i in range(2)
+        ],
+        extra_info={PACKED_ATTENTION_SEGMENT_LENGTHS: [[3], [3]]},
+    )
+    return data, meta
+
+
+def test_streaming_diagnostics_keep_global_outliers_and_filtered_rows(
+    tmp_path: Path,
+) -> None:
+    ctrl = _diagnostic_controller(tmp_path)
+    for errors, group in [((1.2, 4.0), "early"), ((8.0, 1.1), "late")]:
+        data, meta = _diagnostic_chunk(errors, group)
+        ctrl._dp_client = _AdvantageDataPlane(data)
+        asyncio.run(ctrl._advantage_stage(meta))
+        assert len(ctrl._token_logprob_diagnostic_records) <= 2
+        assert "input_ids" in ctrl._dp_client.selected_fields
+        expected = torch.tensor([float(error <= 2.0) for error in errors])
+        torch.testing.assert_close(
+            ctrl._dp_client.written_fields["sample_mask"], expected
+        )
+    assert not (tmp_path / "logprob_diagnostics").exists()
+    ctrl._flush_token_logprob_diagnostics()
+    output = tmp_path / "logprob_diagnostics/token_logprob_outliers_step_000010.jsonl"
+    rows = [json.loads(line) for line in output.read_text().splitlines()]
+    assert [r["sample_index"] for r in rows] == [2, 1]
+    assert [r["metadata"]["sample_id"] for r in rows] == ["late-0", "early-1"]
+    assert [r["diagnostic_rank"] for r in rows] == [0, 1]
+    assert [r["top_tokens"][0]["token_id"] for r in rows] == [11, 21]
+    assert all(r["metadata"]["sample_mask_after_filter"] == 0 for r in rows)
+    assert all(
+        r["metadata"]["weight_version"] == 8
+        and r["metadata"]["trainer_weight_version"] == 9
+        for r in rows
+    )
+    assert all(
+        r["all_token_summary"]["attention_segments_cover_full_length"] for r in rows
+    )
+    assert all(
+        "_per_sequence_mult_prob_error" not in m
+        for m in ctrl._step_log_dict["seq_logprob_error_metrics"]
+    )
+    assert ctrl._token_logprob_diagnostic_records == []
+    assert ctrl._token_logprob_diagnostic_sample_offset == 0
+    ctrl._flush_token_logprob_diagnostics()
+    assert len(output.read_text().splitlines()) == 2
+
+
+def test_disabled_diagnostics_do_not_fetch_tokens_or_write_files(
+    tmp_path: Path,
+) -> None:
+    ctrl = _diagnostic_controller(tmp_path, enabled=False)
+    data, meta = _diagnostic_chunk((4.0, 1.1), "disabled")
+    ctrl._dp_client = _AdvantageDataPlane(data)
+    asyncio.run(ctrl._advantage_stage(meta))
+    ctrl._flush_token_logprob_diagnostics()
+    assert "input_ids" not in ctrl._dp_client.selected_fields
+    assert "input_lengths" not in ctrl._dp_client.selected_fields
+    assert not (tmp_path / "logprob_diagnostics").exists()
+
+
+def test_tree_diagnostics_identify_edge_targets(tmp_path: Path) -> None:
+    ctrl = _diagnostic_controller(tmp_path)
+    data, meta = _diagnostic_chunk((4.0, 1.1), "tree")
+    layout = TreeAttentionLayout((3,), (-1,), (0,), (0, 1), 3)
+    meta.extra_info = {TREE_ATTENTION_LAYOUTS: [layout, layout]}
+    data[TREE_ATTENTION_EDGE_TARGET_IDS] = torch.tensor([[101, 102], [201, 202]])
+    data[TREE_ATTENTION_EDGE_LENGTHS] = torch.tensor([2, 2])
+    ctrl._dp_client = _AdvantageDataPlane(data)
+    asyncio.run(ctrl._advantage_stage(meta))
+    ctrl._flush_token_logprob_diagnostics()
+    rows = [
+        json.loads(s)
+        for s in (
+            tmp_path / "logprob_diagnostics/token_logprob_outliers_step_000010.jsonl"
+        )
+        .read_text()
+        .splitlines()
+    ]
+    assert rows[0]["top_tokens"][0]["token_id"] == 101
+    assert rows[0]["top_tokens"][0]["token_position"] == 1
+    assert TREE_ATTENTION_EDGE_TARGET_IDS in ctrl._dp_client.selected_fields
+
+
+@pytest.mark.parametrize("missing", ["tokenizer", "policy_logprobs"])
+def test_enabled_diagnostics_reject_missing_inputs(
+    tmp_path: Path, missing: str
+) -> None:
+    config = _grpo_master_config(tmp_path)
+    config.logger["token_logprob_diagnostics"] = TokenLogprobDiagnosticsConfig(
+        enabled=True
+    )
+    args = _actor_args_for_init(tokenizer=_DiagnosticTokenizer())
+    if missing == "tokenizer":
+        args.tokenizer = None
+    else:
+        config.loss_fn.force_on_policy_ratio = True
+    with pytest.raises(ValueError, match="require a tokenizer and recomputed"):
+        _init_controller(config, args)
+
+
 def test_advantage_stage_composes_all_filters_before_computing_advantages(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -560,6 +770,7 @@ def test_advantage_stage_composes_all_filters_before_computing_advantages(
 
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
+    ctrl._token_logprob_diagnostics_config = TokenLogprobDiagnosticsConfig()
     ctrl._dp_client = data_plane
     ctrl._advantage_cfg = AdvantageConfig()
     ctrl._advantage_estimator = estimator
@@ -660,6 +871,7 @@ def test_advantage_stage_writes_each_sample_filter_without_seq_threshold(
 
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
+    ctrl._token_logprob_diagnostics_config = TokenLogprobDiagnosticsConfig()
     ctrl._dp_client = data_plane
     ctrl._advantage_cfg = AdvantageConfig()
     ctrl._advantage_estimator = estimator
@@ -725,6 +937,7 @@ def test_advantage_stage_reports_seq_logprob_metrics_without_masking() -> None:
 
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
+    ctrl._token_logprob_diagnostics_config = TokenLogprobDiagnosticsConfig()
     ctrl._dp_client = data_plane
     ctrl._advantage_cfg = AdvantageConfig()
     ctrl._advantage_estimator = estimator
@@ -791,6 +1004,7 @@ def test_advantage_stage_clips_training_values_and_metrics() -> None:
 
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
+    ctrl._token_logprob_diagnostics_config = TokenLogprobDiagnosticsConfig()
     ctrl._dp_client = data_plane
     ctrl._advantage_cfg = AdvantageConfig()
     ctrl._advantage_estimator = estimator
@@ -859,6 +1073,7 @@ def test_advantage_stage_skips_estimator_when_seq_mask_removes_whole_chunk(
 
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
+    ctrl._token_logprob_diagnostics_config = TokenLogprobDiagnosticsConfig()
     ctrl._dp_client = data_plane
     ctrl._advantage_cfg = AdvantageConfig()
     ctrl._advantage_estimator = estimator
@@ -921,6 +1136,7 @@ def test_advantage_stage_skips_preexisting_empty_mask_without_seq_threshold() ->
 
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
+    ctrl._token_logprob_diagnostics_config = TokenLogprobDiagnosticsConfig()
     ctrl._dp_client = data_plane
     ctrl._advantage_cfg = AdvantageConfig()
     ctrl._advantage_estimator = estimator
@@ -969,6 +1185,7 @@ def test_opd_advantage_stage_reads_teacher_and_student_logprobs() -> None:
     """SC passes the TQ teacher column under OPD's estimator contract."""
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
+    ctrl._token_logprob_diagnostics_config = TokenLogprobDiagnosticsConfig()
     captured_kwargs = {}
 
     class FakeEstimator:
@@ -1345,6 +1562,7 @@ class _NoOpDataPlane:
 def _train_pump_controller(*, sampler) -> object:
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
+    ctrl._token_logprob_diagnostics_config = TokenLogprobDiagnosticsConfig()
     ctrl._master_config = SimpleNamespace(
         grpo=GRPOConfig.model_construct(
             num_prompts_per_step=2,
@@ -2319,6 +2537,7 @@ def test_advantage_stage_writes_gae_returns_alongside_advantages() -> None:
     estimator = _GaeLikeEstimator()
     controller_cls = SingleControllerActor.__ray_metadata__.modified_class
     ctrl = object.__new__(controller_cls)
+    ctrl._token_logprob_diagnostics_config = TokenLogprobDiagnosticsConfig()
     ctrl._dp_client = data_plane
     ctrl._advantage_cfg = AdvantageConfig()
     ctrl._advantage_estimator = estimator

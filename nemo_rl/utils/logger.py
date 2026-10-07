@@ -1573,7 +1573,40 @@ class Logger(LoggerInterface):
         relative_position_bins: int = 10,
         top_token_ids_by_total_abs_diff: int = 32,
     ) -> None:
-        """Persist compact token-level logprob mismatch diagnostics as JSONL.
+        """Build and persist compact token-level logprob mismatch diagnostics."""
+        records = self.build_token_logprob_diagnostics(
+            data,
+            tokenizer,
+            step,
+            per_sequence_mult_prob_error=per_sequence_mult_prob_error,
+            sample_metadata=sample_metadata,
+            max_sequences=max_sequences,
+            top_k_tokens_per_sequence=top_k_tokens_per_sequence,
+            min_abs_logprob_diff=min_abs_logprob_diff,
+            min_sequence_mult_prob_error=min_sequence_mult_prob_error,
+            context_tokens=context_tokens,
+            relative_position_bins=relative_position_bins,
+            top_token_ids_by_total_abs_diff=top_token_ids_by_total_abs_diff,
+        )
+        self.log_token_logprob_diagnostic_records(records, step)
+
+    def build_token_logprob_diagnostics(
+        self,
+        data: dict[str, Any],
+        tokenizer: Any,
+        step: int,
+        *,
+        per_sequence_mult_prob_error: torch.Tensor,
+        sample_metadata: Optional[list[dict[str, Any]]] = None,
+        max_sequences: int = 32,
+        top_k_tokens_per_sequence: int = 32,
+        min_abs_logprob_diff: float = 0.25,
+        min_sequence_mult_prob_error: float = 1.05,
+        context_tokens: int = 8,
+        relative_position_bins: int = 10,
+        top_token_ids_by_total_abs_diff: int = 32,
+    ) -> list[dict[str, Any]]:
+        """Build bounded token-level diagnostics without writing or retaining tensors.
 
         Token positions refer to the unshifted input sequence. The records retain
         attention-segment and generated-span boundaries so multi-call rollouts can
@@ -1600,7 +1633,7 @@ class Logger(LoggerInterface):
         )
         selected_indices = valid_indices[:max_sequences]
         if not selected_indices:
-            return
+            return []
 
         def finite_float(value: torch.Tensor) -> Optional[float]:
             scalar = float(value)
@@ -1935,6 +1968,14 @@ class Logger(LoggerInterface):
                 }
             )
 
+        return records
+
+    def log_token_logprob_diagnostic_records(
+        self, records: list[dict[str, Any]], step: int
+    ) -> None:
+        """Persist one batch of records after streaming diagnostic selection."""
+        if not records:
+            return
         filename = os.path.join(
             "logprob_diagnostics", f"token_logprob_outliers_step_{step:06d}.jsonl"
         )

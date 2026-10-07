@@ -180,6 +180,7 @@ class SingleControllerActorArgs:
     # the MSE loss it trains under.
     value_handle: Optional[TQValue] = None
     value_loss_fn: Optional[LossFunction] = None
+    tokenizer: Optional[PreTrainedTokenizerBase] = None
 
 
 def _maybe_restore_native_data_plane_checkpoint(
@@ -1949,5 +1950,6 @@ def setup_single_controller(
         # PPO extras
         value_handle=value,
         value_loss_fn=value_loss_fn,
+        tokenizer=tokenizer,
     )
     return actor_args, setup_timing_metrics
