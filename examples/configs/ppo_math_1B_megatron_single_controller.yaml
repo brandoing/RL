@@ -30,6 +30,10 @@ reward_penalties:
   # token_ids: {unwanted: [2], think_open: 12, think_close: 13}
 
 async_rl:
+  # Optional positive integer Ray CPU reservation for controller-side processing.
+  # null preserves the actor default. Ray also uses the reservation as its OMP
+  # thread default unless OMP_NUM_THREADS is explicitly set.
+  controller_num_cpus: null
   sampler:
     name: in_order
     # How far generation may run ahead of the trainer.
