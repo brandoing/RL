@@ -83,6 +83,24 @@ def _master_config(*, num_prompts_per_step: int = 8, **async_kwargs) -> MasterCo
 
 
 class TestDefaultsAreInert:
+    def test_controller_cpu_reservation_defaults_to_actor_setting(self) -> None:
+        assert AsyncRLConfig().controller_num_cpus is None
+
+    @pytest.mark.parametrize("num_cpus", [1, 8])
+    def test_positive_controller_cpu_reservation_is_preserved(
+        self, num_cpus: int
+    ) -> None:
+        config = AsyncRLConfig(controller_num_cpus=num_cpus)
+        assert config.controller_num_cpus == num_cpus
+        assert config.model_dump()["controller_num_cpus"] == num_cpus
+
+    @pytest.mark.parametrize("num_cpus", [-8, -1, 0, 1.5])
+    def test_invalid_controller_cpu_reservation_is_rejected(
+        self, num_cpus: int | float
+    ) -> None:
+        with pytest.raises(ValidationError, match="controller_num_cpus"):
+            AsyncRLConfig(controller_num_cpus=num_cpus)
+
     def test_timeouts_default_to_disabled(self):
         cfg = AsyncRLConfig()
         assert cfg.rollout_failure.nemo_gym.rollout_timeout_s is None

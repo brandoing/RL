@@ -156,7 +156,10 @@ def main() -> None:
     )
 
     print("🚀 Launching SingleControllerActor")
-    sc = SingleControllerActor.remote(
+    controller = SingleControllerActor
+    if config.async_rl.controller_num_cpus is not None:
+        controller = controller.options(num_cpus=config.async_rl.controller_num_cpus)
+    sc = controller.remote(
         master_config=config,
         actor_args=actor_args,
         setup_timing_metrics=setup_timing_metrics,

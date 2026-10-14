@@ -39,7 +39,8 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         logger={"log_dir": "/tmp/logs"},
         checkpointing={"enabled": False},
         async_rl=SimpleNamespace(
-            stall_watchdog=SimpleNamespace(interval_s=30.0, stall_timeout_s=600.0)
+            controller_num_cpus=None,
+            stall_watchdog=SimpleNamespace(interval_s=30.0, stall_timeout_s=600.0),
         ),
         grpo=GRPOConfig(async_grpo=None),
     )
@@ -58,6 +59,8 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     # check so these tests keep exercising the same path they always did.
     ray_wait = MagicMock(side_effect=lambda refs, timeout=None: (list(refs), []))
     ray_kill = MagicMock()
+    actor_remote = MagicMock(return_value=actor)
+    actor_options = MagicMock(return_value=SimpleNamespace(remote=actor_remote))
 
     monkeypatch.setattr(
         run_grpo_single_controller,
@@ -95,7 +98,10 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     monkeypatch.setattr(
         run_grpo_single_controller.SingleControllerActor,
         "remote",
-        MagicMock(return_value=actor),
+        actor_remote,
+    )
+    monkeypatch.setattr(
+        run_grpo_single_controller.SingleControllerActor, "options", actor_options
     )
     monkeypatch.setattr(run_grpo_single_controller.ray, "get", ray_get)
     monkeypatch.setattr(run_grpo_single_controller.ray, "wait", ray_wait)
@@ -103,6 +109,8 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
 
     return SimpleNamespace(
         actor_args=actor_args,
+        actor_remote=actor_remote,
+        actor_options=actor_options,
         config=config,
         configure_generation=configure_generation,
         configured_generation=configured_generation,
@@ -111,6 +119,33 @@ def main_context(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         ray_wait=ray_wait,
         ray_kill=ray_kill,
         setup_single_controller=setup_single_controller,
+    )
+
+
+def test_main_preserves_default_controller_cpu_reservation(
+    main_context: SimpleNamespace,
+) -> None:
+    run_grpo_single_controller.main()
+
+    main_context.actor_options.assert_not_called()
+    main_context.actor_remote.assert_called_once()
+
+
+@pytest.mark.parametrize("num_cpus", [1, 8])
+def test_main_applies_explicit_controller_cpu_reservation(
+    main_context: SimpleNamespace, num_cpus: int
+) -> None:
+    main_context.config.async_rl.controller_num_cpus = num_cpus
+
+    run_grpo_single_controller.main()
+
+    main_context.actor_options.assert_called_once_with(num_cpus=num_cpus)
+    main_context.actor_remote.assert_called_once()
+    assert main_context.actor_remote.call_args.kwargs["master_config"] is (
+        main_context.config
+    )
+    assert main_context.actor_remote.call_args.kwargs["actor_args"] is (
+        main_context.actor_args
     )
 
 

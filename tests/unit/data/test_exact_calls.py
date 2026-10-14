@@ -1,14 +1,21 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+import random
+from dataclasses import replace
 from itertools import permutations
+from unittest.mock import patch
 
 import pytest
 import torch
 
 from nemo_rl.data.exact_calls import (
     _build_exact_call_tree,
+    _exact_call_trie_diagnostics,
+    _flatten_exact_call,
+    _page_aligned_execution_prefix_length,
     _tensor_parts_common_prefix_length,
+    _tensor_parts_first_row_containing,
 )
 
 
@@ -91,3 +98,71 @@ def test_common_prefix_ignores_empty_message_parts() -> None:
         )
         == 1
     )
+
+
+def test_diagnostic_cache_matches_uncached_pair_classification() -> None:
+    rng = random.Random(20261014)
+    for _ in range(40):
+        calls = []
+        for index in range(12):
+            length = rng.randrange(2, 28)
+            tokens = list(range(length))
+            if rng.random() < 0.2:
+                tokens[rng.randrange(length)] = 100
+            routes = [0] * (length - 1) + [-1]
+            if rng.random() < 0.6:
+                routes[rng.randrange(length - 1)] = rng.choice([-1, 1, 2])
+            call = _flatten_exact_call(_call(tokens, routes), index)
+            call = replace(
+                call,
+                generation_replica_id=rng.choice(["replica-0", "replica-1", None]),
+                kv_cache_num_cached_tokens=rng.choice([None, 0, 2, 8, 64]),
+                has_incomplete_routes=rng.random() < 0.1,
+            )
+            if rng.random() < 0.1:
+                call = replace(call, routed_expert_parts=None)
+            calls.append(call)
+        expected = [
+            _page_aligned_execution_prefix_length(prefix, descendant)
+            for prefix in calls
+            for descendant in calls
+        ]
+        cache = {}
+        actual = [
+            _page_aligned_execution_prefix_length(
+                prefix, descendant, missing_route_rows=cache
+            )
+            for prefix in calls
+            for descendant in calls
+        ]
+        assert actual == expected
+        forks, shared, replicas = _exact_call_trie_diagnostics(calls)
+        assert forks == sum(x is not None for x in expected)
+        assert shared == sum(x for x in expected if x is not None)
+        assert replicas == {
+            c.generation_replica_id
+            for c in calls
+            if c.generation_replica_id is not None
+        }
+
+
+def test_diagnostic_scan_is_bounded_and_cache_is_not_reused_after_mutation() -> None:
+    calls = [
+        _flatten_exact_call(
+            _call(list(range(length)), [0] * (length - 2) + [1, -1]), index
+        )
+        for index, length in enumerate([5, 7, 9, 11])
+    ]
+    # Empty messages and a terminal missing-route placeholder are valid views.
+    for call in calls:
+        call.routed_expert_parts.insert(0, torch.empty((0, 1, 1), dtype=torch.long))
+    with patch(
+        "nemo_rl.data.exact_calls._tensor_parts_first_row_containing",
+        wraps=_tensor_parts_first_row_containing,
+    ) as scan:
+        before = _exact_call_trie_diagnostics(calls)
+        assert before[0] == 6
+        assert scan.call_count == len(calls)
+    for call in calls:
+        call.routed_expert_parts[1][0] = -1
+    assert _exact_call_trie_diagnostics(calls)[:2] == (0, 0)

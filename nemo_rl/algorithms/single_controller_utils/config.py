@@ -445,6 +445,10 @@ class WatchdogConfig(BaseModel, extra="allow"):
 
 
 class AsyncRLConfig(BaseModel, extra="allow"):
+    # Optional Ray CPU reservation for the controller. None preserves its actor
+    # default; positive integers also set Ray's default OMP thread budget unless
+    # OMP_NUM_THREADS is explicitly supplied in the runtime environment.
+    controller_num_cpus: int | None = Field(default=None, ge=1)
     # Staleness policy shared by the rollout and train pumps.
     sampler: SamplerConfig = Field(
         default_factory=InOrderSamplerConfig,
