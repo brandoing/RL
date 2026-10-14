@@ -431,7 +431,10 @@ def _is_exact_execution_prefix(
 
 
 def _page_aligned_execution_prefix_length(
-    prefix: _ExactCallSequence, descendant: _ExactCallSequence
+    prefix: _ExactCallSequence,
+    descendant: _ExactCallSequence,
+    *,
+    missing_route_rows: dict[int, int | None] | None = None,
 ) -> int | None:
     """Return the fully reusable cache-page prefix, or ``None`` if unproven.
 
@@ -473,16 +476,28 @@ def _page_aligned_execution_prefix_length(
     if reusable_length <= 0:
         return None
     descendant_routes = cast(list[torch.Tensor], descendant.routed_expert_parts)
-    if _tensor_parts_prefix_contains_value(
-        prefix.routed_expert_parts,
-        prefix_length=reusable_length,
-        value=ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
-    ) or _tensor_parts_prefix_contains_value(
-        descendant_routes,
-        prefix_length=reusable_length,
-        value=ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
-    ):
-        return None
+    for call in (prefix, descendant):
+        routes = cast(list[torch.Tensor], call.routed_expert_parts)
+        if missing_route_rows is None:
+            missing = _tensor_parts_prefix_contains_value(
+                routes,
+                prefix_length=reusable_length,
+                value=ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
+            )
+        else:
+            # Calls remain alive and their tensors are read-only during one
+            # diagnostic pass. Scan each call once rather than every pair.
+            key = id(call)
+            if key not in missing_route_rows:
+                missing_route_rows[key] = _tensor_parts_first_row_containing(
+                    [part for part in routes if part.shape[0]],
+                    prefix_length=call.length - 1,
+                    value=ROUTED_EXPERTS_MISSING_ROUTE_SENTINEL,
+                )
+            first_missing = missing_route_rows[key]
+            missing = first_missing is not None and first_missing < reusable_length
+        if missing:
+            return None
     if not _tensor_parts_equal_prefix(
         prefix.routed_expert_parts,
         descendant_routes,
@@ -504,9 +519,14 @@ def _exact_call_trie_diagnostics(
     """Count conservative page forks and replicas used by one rollout."""
     page_forks = 0
     page_shared_tokens = 0
+    # Never retain this cache across invocations: captured tensor views can be
+    # mutated or replaced between diagnostic passes.
+    missing_route_rows: dict[int, int | None] = {}
     for prefix in calls:
         for descendant in calls:
-            reusable_length = _page_aligned_execution_prefix_length(prefix, descendant)
+            reusable_length = _page_aligned_execution_prefix_length(
+                prefix, descendant, missing_route_rows=missing_route_rows
+            )
             if reusable_length is not None:
                 page_forks += 1
                 page_shared_tokens += reusable_length
